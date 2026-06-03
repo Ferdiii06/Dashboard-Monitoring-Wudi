@@ -1,0 +1,1390 @@
+<?php
+
+namespace App\AI\Services;
+
+use App\Models\Todo;
+use App\Models\User;
+use Carbon\Carbon;
+use Illuminate\Support\Facades\Cache;
+
+class AiTaskManagerService
+{
+    private const CREATE_WORDS = ['create', 'add', 'make', 'bikin', 'buat', 'buatkan', 'buatin', 'tambahkan', 'tambah', 'tambahin', 'catat', 'catetin', 'masukkan', 'masukin', 'simpan', 'ingetin', 'ingatkan', 'jadwalkan', 'jadwalin'];
+    private const EDIT_WORDS = ['edit', 'update', 'ubah', 'ubahin', 'rubah', 'ganti', 'gantiin', 'change', 'rename', 'reschedule', 'revisi', 'benerin', 'perbaiki', 'perbaikin', 'perbarui', 'majuin', 'mundurin', 'pindah', 'pindahin', 'geser', 'atur', 'set', 'jadikan'];
+    private const DELETE_WORDS = ['delete', 'remove', 'hapus', 'hapuskan', 'apus', 'apusin', 'buang', 'ilangin', 'hilangin', 'coret', 'coretin', 'batalin', 'cancel'];
+    private const COMPLETE_WORDS = ['complete', 'finish', 'done', 'selesai', 'selese', 'beres', 'kelar', 'rampung', 'tuntas', 'udah', 'sudah'];
+    private const TASK_WORDS = ['task', 'todo', 'tugas', 'jadwal', 'agenda', 'reminder', 'pengingat', 'kerjaan', 'pekerjaan'];
+    private const MAX_DEADLINE_YEARS = 15;
+
+    private bool $usesEnglish = false;
+
+    private function t(string $en, string $id): string
+    {
+        return $this->usesEnglish ? $en : $id;
+    }
+
+    public function apply(User $user, string $message): array
+    {
+        $text = $this->normalizeCasualText(trim($message));
+        $lower = strtolower($text);
+        $this->usesEnglish = $this->isMostlyEnglish($lower);
+
+        $draftKey = "ai:task:draft:{$user->id}";
+        $pendingKey = "ai:task:pending:{$user->id}";
+        $draft = Cache::get($draftKey);
+        $pending = Cache::get($pendingKey);
+
+        if ($this->isBulkModificationRequest($lower)) {
+            Cache::forget($draftKey);
+            Cache::forget($pendingKey);
+            return [
+                'action' => 'unsupported_bulk_operation',
+                'kind' => 'error',
+                'note' => $this->t(
+                    "Sorry, I can't update multiple tasks at once. I can only help with one task at a time — just tell me which specific task you'd like to work with.",
+                    "Maaf, aku belum bisa mengubah semua task sekaligus. Aku hanya bisa bantu satu task per satu — sebutkan task mana yang mau kamu ubah ya 🙂"
+                ),
+            ];
+        }
+
+        if ($this->hasOutOfRangeExplicitYear($text)) {
+            Cache::forget($draftKey);
+            Cache::forget($pendingKey);
+
+            return $this->deadlineTooFarResponse();
+        }
+
+        if ($this->isRecommendationOnly($lower) || $this->isConsultationOnly($lower)) {
+            Cache::forget($pendingKey);
+            return ['action' => null];
+        }
+
+        if ($pending && preg_match('/(?:^|\b)(?:create|add|make|bikin|bkin|buat|baut|buatkan|bautkan|buatin|tambahkan|tambah|tambahin|tmbh)\s+(?:a\s+)?(?:task|todo|tugas)\s+(.+)/i', $text)) {
+            Cache::forget($pendingKey);
+            $pending = null;
+        }
+
+        if ($pending && preg_match('/\b(cancel|batal|batalkan|stop)\b/i', $text)) {
+            Cache::forget($pendingKey);
+            return [
+                'action' => 'cancelled_task_action',
+                'note' => $this->t(
+                    "Got it, cancelled! Just tell me what you'd like to do next 👌",
+                    'Oke, aku batalin dulu ya. Kalau mau lanjut, bilang lagi aja tugasnya mau diapain 👌'
+                ),
+            ];
+        }
+
+        if ($pending && ($pending['action'] ?? null) === 'delete_confirm') {
+            return $this->continueDeleteConfirmation($user, $pendingKey, $pending, $text);
+        }
+
+        if ($pending && ($pending['action'] ?? null) !== 'delete' && $this->isDeleteIntent($lower)) {
+            Cache::forget($pendingKey);
+            return $this->handleTaskAction($user, $pendingKey, 'delete', $text);
+        }
+
+        if ($pending && ($pending['action'] ?? null) !== 'complete' && $this->isCompleteIntent($lower)) {
+            Cache::forget($pendingKey);
+            return $this->handleTaskAction($user, $pendingKey, 'complete', $text);
+        }
+
+        if ($pending) {
+            if ($this->isLastTaskReference($text) && !empty($pending['task_id'])) {
+                $pending['candidates'] = [$pending['task_id']];
+            }
+
+            return $this->continuePendingAction($user, $pendingKey, $pending, $text);
+        }
+
+        if ($draft && preg_match('/\b(cancel|batal|batalkan|stop)\b/i', $text)) {
+            Cache::forget($draftKey);
+            return [
+                'action' => 'cancelled_task_draft',
+                'note' => $this->t(
+                    "Draft cancelled. Whenever you're ready, just tell me the title and deadline 👌",
+                    'Oke, draft-nya aku batalin ya. Kalau mau bikin lagi, tinggal sebut judul sama deadlinenya 👌'
+                ),
+            ];
+        }
+
+        if ($draft && preg_match('/\b(save|simpan|confirm|konfirmasi|buat sekarang|create now)\b/i', $text)) {
+            return $this->createFromDraft($user, $draftKey, $draft);
+        }
+
+        if ($draft) {
+            $draft = $this->mergeDraft($draft, $text);
+            Cache::put($draftKey, $draft, now()->addMinutes(15));
+
+            return [
+                'action' => 'draft_task',
+                'draft' => $draft,
+                'note' => $this->draftPrompt($draft),
+            ];
+        }
+
+        if (preg_match('/(?:^|\b)(?:create|add|make|bikin|bkin|buat|baut|buatkan|bautkan|buatin|tambahkan|tambah|tambahin|tmbh)\s+(?:a\s+)?(?:task|todo|tugas)(?:\s+pribadi)?\s+(.+)/i', $text, $match)) {
+            $rawTitle = trim($match[1]);
+            $draft = $this->mergeDraft([
+                'title' => $this->extractTitle($rawTitle),
+                'description' => null,
+                'deadline' => $this->extractDeadline($rawTitle)?->toDateTimeString(),
+                'priority' => $this->extractPriority($lower),
+            ], $text);
+
+            if (!empty($draft['title']) && !empty($draft['deadline'])) {
+                Cache::put($draftKey, $draft, now()->addMinutes(15));
+                return $this->createFromDraft($user, $draftKey, $draft);
+            }
+
+            Cache::put($draftKey, $draft, now()->addMinutes(15));
+
+            return [
+                'action' => 'draft_task',
+                'draft' => $draft,
+                'note' => $this->draftPrompt($draft),
+            ];
+        }
+
+        if ($this->hasStructuredTaskFields($text)) {
+            $draft = $this->mergeDraft([
+                'title' => null,
+                'description' => null,
+                'deadline' => null,
+                'priority' => null,
+            ], $text);
+
+            if (!empty($draft['title']) && !empty($draft['deadline'])) {
+                Cache::put($draftKey, $draft, now()->addMinutes(15));
+                return $this->createFromDraft($user, $draftKey, $draft);
+            }
+
+            Cache::put($draftKey, $draft, now()->addMinutes(15));
+
+            return [
+                'action' => 'draft_task',
+                'draft' => $draft,
+                'note' => $this->draftPrompt($draft),
+            ];
+        }
+
+        if ($this->looksLikeCreateIntent($lower)) {
+            $hasTitleField = preg_match('/\b(?:nama(?:nya)?|judul|title)\b/i', $text) === 1;
+            $rawTitle = $hasTitleField
+                ? $text
+                : $this->removeIntentWords($text, array_merge(self::CREATE_WORDS, self::TASK_WORDS, ['pribadi']));
+            $draft = $this->mergeDraft([
+                'title' => $this->extractTitle($rawTitle),
+                'description' => null,
+                'deadline' => $this->extractDeadline($text)?->toDateTimeString(),
+                'priority' => $this->extractPriority($lower),
+            ], $text);
+
+            if (!empty($draft['title']) && !empty($draft['deadline'])) {
+                Cache::put($draftKey, $draft, now()->addMinutes(15));
+                return $this->createFromDraft($user, $draftKey, $draft);
+            }
+
+            Cache::put($draftKey, $draft, now()->addMinutes(15));
+
+            return [
+                'action' => 'draft_task',
+                'draft' => $draft,
+                'note' => $this->draftPrompt($draft),
+            ];
+        }
+
+        if ($this->isCreateIntent($lower)) {
+            $draft = [
+                'title' => null,
+                'description' => null,
+                'deadline' => $this->extractDeadline($text)?->toDateTimeString(),
+                'priority' => $this->extractPriority($lower),
+            ];
+            Cache::put($draftKey, $draft, now()->addMinutes(15));
+
+            return [
+                'action' => 'draft_task',
+                'draft' => $draft,
+                'note' => $this->draftPrompt($draft),
+            ];
+        }
+
+        if ($this->isCompleteIntent($lower)) {
+            return $this->handleTaskAction($user, $pendingKey, 'complete', $text);
+        }
+
+        if ($this->isDeleteIntent($lower)) {
+            return $this->handleTaskAction($user, $pendingKey, 'delete', $text);
+        }
+
+        if ($this->isEditIntent($lower)) {
+            return $this->handleTaskAction($user, $pendingKey, 'edit', $text);
+        }
+
+        if ($this->isLastTaskReference($text) && ($lastTask = $this->lastReferencedTask($user))) {
+            $updates = $this->extractUpdates($text);
+            if (!empty($updates)) {
+                return $this->updateTask($user, $pendingKey, $lastTask, $updates);
+            }
+        }
+
+        if ($this->isSummaryRequest($lower)) {
+            return $this->handleSummaryRequest($user, $lower);
+        }
+
+        if ($this->isClosestDeadlineRequest($lower)) {
+            return $this->handleClosestDeadlineRequest($user);
+        }
+
+        if ($this->isOverdueRequest($lower)) {
+            return $this->handleOverdueRequest($user);
+        }
+
+        if ($this->isActiveTaskListRequest($lower)) {
+            return $this->handleActiveTaskListRequest($user);
+        }
+
+        return ['action' => null];
+    }
+
+    private function continuePendingAction(User $user, string $pendingKey, array $pending, string $text): array
+    {
+        if ($this->isLastTaskReference($text) && !empty($pending['task_id'])) {
+            $pending['candidates'] = [$pending['task_id']];
+        }
+
+        $todo = $this->selectPendingTask($user, $pending, $text);
+        if (!$todo) {
+            return $this->askWhichTask($user, $pendingKey, $pending['action'], $pending['candidates'] ?? [], $this->commandNotFoundText($text));
+        }
+
+        if (($pending['action'] ?? null) === 'edit') {
+            $updates = array_merge($pending['updates'] ?? [], $this->extractUpdates($text));
+            if (empty($updates)) {
+                $pending['task_id'] = $todo->id;
+                Cache::put($pendingKey, $pending, now()->addMinutes(10));
+                return [
+                    'action' => 'clarify_task_edit',
+                    'kind' => 'task_action_clarify',
+                    'task' => $this->taskPayload($todo),
+                    'note' => $this->t(
+                            "Got it, task \"{$todo->judul}\". What would you like to change? Title, deadline, priority, or description 🙂",
+                            "Oke, task “{$todo->judul}”. Mau diubah apa nih? Bisa judul, deadline, priority, atau deskripsi 🙂"
+                        ),
+                ];
+            }
+
+            return $this->updateTask($user, $pendingKey, $todo, $updates);
+        }
+
+        if (($pending['action'] ?? null) === 'delete') {
+            return $this->confirmDeleteTask($user, $pendingKey, $todo);
+        }
+
+        if (($pending['action'] ?? null) === 'complete') {
+            return $this->completeTask($user, $pendingKey, $todo);
+        }
+
+        Cache::forget($pendingKey);
+        return ['action' => null];
+    }
+
+    private function handleTaskAction(User $user, string $pendingKey, string $action, string $text): array
+    {
+        $needle = $this->extractTaskNeedle($text, $action);
+        $updates = $action === 'edit' ? $this->extractUpdates($text) : [];
+        if ($this->isLastTaskReference($text) && ($lastTask = $this->lastReferencedTask($user))) {
+            if ($action === 'edit' && !empty($updates)) {
+                return $this->updateTask($user, $pendingKey, $lastTask, $updates);
+            }
+
+            $candidates = collect([$lastTask]);
+        } else {
+            $candidates = $needle ? $this->findUserTasks($user, $needle, 5) : $this->activeTasks($user, 5);
+        }
+
+        if ($candidates->isEmpty() && $needle !== '') {
+            $candidates = $this->findUserTasksByWords($user, $needle, 5);
+        }
+
+        if ($this->isLastTaskReference($text) && ($lastTask = $this->lastReferencedTask($user))) {
+            if ($action === 'edit') {
+                if (empty($updates)) {
+                    Cache::put($pendingKey, ['action' => 'edit', 'task_id' => $lastTask->id, 'candidates' => [$lastTask->id], 'updates' => []], now()->addMinutes(10));
+                    return [
+                        'action' => 'clarify_task_edit',
+                        'kind' => 'task_action_clarify',
+                        'task' => $this->taskPayload($lastTask),
+                        'note' => $this->t(
+                                "Got it, task \"{$lastTask->judul}\". What would you like to change? Title, deadline, priority, or description 🙂",
+                                "Oke, task “{$lastTask->judul}”. Mau diubah apa nih? Bisa judul, deadline, priority, atau deskripsi 🙂"
+                            ),
+                    ];
+                }
+
+                return $this->updateTask($user, $pendingKey, $lastTask, $updates);
+            }
+
+            return $action === 'delete'
+                ? $this->confirmDeleteTask($user, $pendingKey, $lastTask)
+                : $this->completeTask($user, $pendingKey, $lastTask);
+        }
+
+        if ($needle === '') {
+            return $this->askWhichTask($user, $pendingKey, $action, $candidates->pluck('id')->all(), $this->clarifyActionText($action, $candidates->isEmpty(), $text));
+        }
+
+        if ($candidates->isEmpty()) {
+            Cache::forget($pendingKey);
+            return [
+                'action' => 'command_not_found',
+                'kind' => 'empty_state',
+                'title' => $this->commandNotFoundText($text),
+                'note' => $this->commandNotFoundText($text),
+            ];
+        }
+
+        if ($candidates->count() === 1) {
+            $todo = $candidates->first();
+            $this->rememberTaskReference($user, $todo);
+            if ($action === 'edit') {
+                if (empty($updates)) {
+                    Cache::put($pendingKey, ['action' => 'edit', 'task_id' => $todo->id, 'candidates' => [$todo->id], 'updates' => []], now()->addMinutes(10));
+                    return [
+                        'action' => 'clarify_task_edit',
+                        'kind' => 'task_action_clarify',
+                        'task' => $this->taskPayload($todo),
+                        'note' => $this->t(
+                                "Found \"{$todo->judul}\". What would you like to edit? Title, deadline, priority, or description?",
+                                "Ketemu “{$todo->judul}”. Mau edit bagian apa? Judul, deadline, priority, atau deskripsi?"
+                            ),
+                    ];
+                }
+
+                return $this->updateTask($user, $pendingKey, $todo, $updates);
+            }
+
+            return $action === 'delete'
+                ? $this->confirmDeleteTask($user, $pendingKey, $todo)
+                : $this->completeTask($user, $pendingKey, $todo);
+        }
+
+        return $this->askWhichTask($user, $pendingKey, $action, $candidates->pluck('id')->all(), $this->clarifyActionText($action, $candidates->isEmpty(), $text));
+    }
+
+    private function askWhichTask(User $user, string $pendingKey, string $action, array $candidateIds, string $note): array
+    {
+        $tasks = empty($candidateIds)
+            ? $this->activeTasks($user, 5)
+            : Todo::query()->where('user_id', $user->id)->whereIn('id', $candidateIds)->orderBy('deadline')->get();
+        $ids = $tasks->pluck('id')->all();
+        Cache::put($pendingKey, ['action' => $action, 'candidates' => $ids, 'updates' => []], now()->addMinutes(10));
+
+        return [
+            'action' => 'clarify_task_action',
+            'kind' => 'task_candidates',
+            'tasks' => $tasks->map(fn (Todo $todo) => $this->taskPayload($todo))->values()->all(),
+            'note' => $note . ($tasks->isEmpty() ? '' : ($this->isMostlyEnglish($note)
+                ? "\n\nPick the task number/name. If you want to cancel, say “cancel”."
+                : "\n\nPilih nomor/nama task-nya aja. Kalau nggak jadi, bilang “batal”.")),
+        ];
+    }
+
+    private function clarifyActionText(string $action, bool $empty, string $message): string
+    {
+        if ($empty) {
+            return $this->commandNotFoundText($message);
+        }
+
+        if ($this->isMostlyEnglish($message)) {
+            return match ($action) {
+                'edit' => 'Which task do you want to edit?',
+                'delete' => 'Which task do you want to delete?',
+                'complete' => 'Which task is completed?',
+                default => 'Which one?',
+            };
+        }
+
+        return match ($action) {
+            'edit' => 'Yang mau diedit yang mana nih?',
+            'delete' => 'Yang mau dihapus yang mana nih?',
+            'complete' => 'Yang sudah selesai yang mana nih?',
+            default => 'Yang mana nih?',
+        };
+    }
+
+    private function commandNotFoundText(string $message): string
+    {
+        return $this->isMostlyEnglish($message)
+            ? 'Sorry, that command was not found.'
+            : 'Mohon maaf, command tersebut tidak ada.';
+    }
+
+    private function isMostlyEnglish(string $message): bool
+    {
+        return preg_match('/\b(the|that|this|what|which|task|todo|deadline|priority|delete|edit|complete|finish|show|summarize|please)\b/i', $message) === 1;
+    }
+
+    private function selectPendingTask(User $user, array $pending, string $text): ?Todo
+    {
+        $candidateIds = $pending['candidates'] ?? [];
+        if (!empty($pending['task_id'])) {
+            return Todo::query()->where('user_id', $user->id)->where('id', $pending['task_id'])->first();
+        }
+
+        if (count($candidateIds) === 1) {
+            return Todo::query()->where('user_id', $user->id)->where('id', $candidateIds[0])->first();
+        }
+
+        if (preg_match('/\b(?:nomor|no\.?|number)?\s*(\d{1,2})\b/i', $text, $match)) {
+            $index = (int) $match[1] - 1;
+            $id = $candidateIds[$index] ?? null;
+            if ($id) {
+                return Todo::query()->where('user_id', $user->id)->where('id', $id)->first();
+            }
+        }
+
+        return $this->findUserTask($user, $text);
+    }
+
+    private function updateTask(User $user, string $pendingKey, Todo $todo, array $updates): array
+    {
+        if (!$this->deadlineWithinAllowedRange($updates['deadline'] ?? null)) {
+            Cache::forget($pendingKey);
+
+            return $this->deadlineTooFarResponse();
+        }
+
+        $todo->update($updates);
+        Cache::forget($pendingKey);
+        Cache::forget("ai:context:{$user->id}");
+        $this->rememberTaskReference($user, $todo);
+
+        return [
+            'action' => 'updated_task',
+            'kind' => 'task_updated',
+            'task' => $this->taskPayload($todo->fresh()),
+            'note' => $this->t(
+                "Got it! \"{$todo->judul}\" has been updated ✅",
+                "Sip, “{$todo->judul}” sudah aku update ✅"
+            ),
+        ];
+    }
+
+    private function deleteTask(User $user, string $pendingKey, Todo $todo): array
+    {
+        $title = $todo->judul;
+        Cache::forget("ai:task:last:{$user->id}");
+        $todo->delete();
+        Cache::forget($pendingKey);
+        Cache::forget("ai:context:{$user->id}");
+
+        return ['action' => 'deleted_task', 'kind' => 'task_deleted', 'note' => $this->t(
+            "Done! Task \"{$title}\" has been deleted.",
+            "Oke, task “{$title}” sudah aku hapus."
+        )];
+    }
+
+    private function confirmDeleteTask(User $user, string $pendingKey, Todo $todo): array
+    {
+        $this->rememberTaskReference($user, $todo);
+        Cache::put($pendingKey, [
+            'action' => 'delete_confirm',
+            'task_id' => $todo->id,
+            'candidates' => [$todo->id],
+            'updates' => [],
+        ], now()->addMinutes(10));
+
+        return [
+            'action' => 'confirm_task_delete',
+            'kind' => 'task_delete_confirm',
+            'task' => $this->taskPayload($todo),
+            'note' => $this->t(
+                "Found \"{$todo->judul}\". Sure you want to delete it? Reply \"delete it\" to confirm, or \"cancel\" to abort.",
+                "Aku ketemu “{$todo->judul}”. Yakin mau hapus? Balas “ya hapus” untuk konfirmasi, atau “batal” kalau nggak jadi."
+            ),
+        ];
+    }
+
+    private function continueDeleteConfirmation(User $user, string $pendingKey, array $pending, string $text): array
+    {
+        $todo = $this->selectPendingTask($user, $pending, $text);
+        if (!$todo) {
+            Cache::forget($pendingKey);
+            return ['action' => null];
+        }
+
+        if (preg_match('/\b(?:ya\s+hapus|hapus\s+ya|confirm\s+delete|delete\s+it|yes\s+delete|konfirmasi\s+hapus|lanjut\s+hapus)\b/i', $text)) {
+            return $this->deleteTask($user, $pendingKey, $todo);
+        }
+
+        $this->rememberTaskReference($user, $todo);
+        Cache::put($pendingKey, $pending, now()->addMinutes(10));
+
+        return [
+            'action' => 'confirm_task_delete',
+            'kind' => 'task_delete_confirm',
+            'task' => $this->taskPayload($todo),
+            'note' => $this->t(
+                "Just to be safe, \"{$todo->judul}\" hasn't been deleted yet. Reply \"delete it\" to confirm, or \"cancel\" to abort.",
+                "Biar aman, aku belum hapus “{$todo->judul}”. Kalau yakin, balas “ya hapus”. Kalau nggak jadi, bilang “batal”."
+            ),
+        ];
+    }
+
+    private function completeTask(User $user, string $pendingKey, Todo $todo): array
+    {
+        $todo->update(['is_completed' => true]);
+        Cache::forget($pendingKey);
+        Cache::forget("ai:context:{$user->id}");
+        $this->rememberTaskReference($user, $todo);
+
+        return ['action' => 'completed_task', 'kind' => 'task_completed', 'task' => $this->taskPayload($todo->fresh()), 'note' => $this->t(
+            "Done! \"{$todo->judul}\" has been marked as complete ✅",
+            "Sip, “{$todo->judul}” aku tandai selesai ✅"
+        )];
+    }
+
+    private function normalizeCasualText(string $text): string
+    {
+        $replacements = [
+            '/\bgw\b/i' => 'aku',
+            '/\bgue\b/i' => 'aku',
+            '/\bgua\b/i' => 'aku',
+            '/\byg\b/i' => 'yang',
+            '/\bdlu\b/i' => 'dulu',
+            '/\bskrg\b/i' => 'sekarang',
+            '/\bbsk\b/i' => 'besok',
+            '/\bntar\b/i' => 'nanti',
+            '/\btdi\b/i' => 'tadi',
+            '/\bgmn\b/i' => 'gimana',
+            '/\bprioritasin\b/i' => 'prioritaskan',
+            '/\bjadwalin\b/i' => 'jadwalkan',
+        ];
+
+        return trim(preg_replace(array_keys($replacements), array_values($replacements), $text) ?? $text);
+    }
+
+    private function isLastTaskReference(string $text): bool
+    {
+        return preg_match('/\b(?:ini|itu|tadi|task\s+itu|tugas\s+itu|yang\s+tadi|hapus\s+aja|udah\s+beres|sudah\s+beres|ubah\s+jam|ganti\s+jam)\b/i', $text) === 1;
+    }
+
+    private function rememberTaskReference(User $user, Todo $todo): void
+    {
+        Cache::put("ai:task:last:{$user->id}", $todo->id, now()->addMinutes(30));
+    }
+
+    private function lastReferencedTask(User $user): ?Todo
+    {
+        $id = Cache::get("ai:task:last:{$user->id}");
+        if (!$id) {
+            return null;
+        }
+
+        return Todo::query()->where('user_id', $user->id)->where('id', $id)->first();
+    }
+
+    private function isEditIntent(string $lower): bool
+    {
+        return $this->hasFuzzyWord($lower, self::EDIT_WORDS)
+            && preg_match('/\b(code|kode|coding|programming|script|bug|debug)\b/', $lower) !== 1;
+    }
+
+    private function isRecommendationOnly(string $lower): bool
+    {
+        return preg_match('/\b(rekomendasi(?:kan)?|recommend|suggest|saran(?:in)?|konsultasi|konsul|curhat|nanya|tanya|enak\s+(?:gimana|mana|apa|dikerjain|dimulai))\b/', $lower) === 1
+            && preg_match('/\b(create|add|make|bikin|buat|buatkan|hapus|delete|remove|edit|ubah|update|complete|done|selesai)\b/', $lower) !== 1;
+    }
+
+    private function isConsultationOnly(string $lower): bool
+    {
+        return preg_match('/\b(bingung|kewalahan|overwhelmed|capek|lelah|pusing|mulai\s+dari\s+mana|harus\s+mulai|atur\s+prioritas|prioritas\s+dulu|minta\s+saran|butuh\s+saran|butuh\s+masukan)\b/', $lower) === 1
+            && preg_match('/\b(create|add|make|bikin|buat\s+(?:task|todo|tugas|jadwal|reminder|pengingat)|buatkan|buatin|tambahkan|tambah(?:kan|in)?|hapus|delete|remove|edit|ubah|update|complete|done|selesai)\b/', $lower) !== 1;
+    }
+
+    private function isCreateIntent(string $lower): bool
+    {
+        return $this->looksLikeCreateIntent($lower);
+    }
+
+    private function isDeleteIntent(string $lower): bool
+    {
+        return $this->hasFuzzyWord($lower, self::DELETE_WORDS)
+            && preg_match('/\b(code|kode|coding|programming|script)\b/', $lower) !== 1;
+    }
+
+    private function isCompleteIntent(string $lower): bool
+    {
+        return ($this->hasFuzzyWord($lower, self::COMPLETE_WORDS) || preg_match('/\b(mark\s+(?:as\s+)?done|tandai\s+selesai)\b/', $lower) === 1)
+            && preg_match('/\b(code|kode|coding|programming|script)\b/', $lower) !== 1;
+    }
+
+    private function looksLikeCreateIntent(string $lower): bool
+    {
+        return $this->hasFuzzyWord($lower, self::CREATE_WORDS)
+            && $this->hasFuzzyWord($lower, self::TASK_WORDS);
+    }
+
+    private function extractTaskNeedle(string $text, string $action): string
+    {
+        if ($action === 'edit' && preg_match('/\b(?:judul|title|nama|namanya|deskripsi|description|desc)\s+(?:task|todo|tugas)?\s*(.+?)\s+(?:jadi|to|ke|=|:)\s+.+$/i', $text, $match)) {
+            $needle = trim($match[1]);
+            if ($needle !== '') {
+                return $needle;
+            }
+        }
+
+        if ($action === 'edit' && preg_match('/\b(?:deadline|tanggal|date|jam|pukul|at|priority|prioritas|deskripsi|description|desc|judul|title|nama|namanya)\b/i', $text, $field, PREG_OFFSET_CAPTURE)) {
+            $prefix = trim(substr($text, 0, $field[0][1]));
+            $prefix = preg_replace('/\b(edit|editt|update|ubah|ubahin|rubah|ganti|gantiin|gnti|change|rename|renam|renamein|reschedule|reskedul|editin|revisi|benerin|bnerin|perbaiki|perbaikin|perbarui|majuin|mundurin|task|todo|tugas|yang|ini|itu|the|my|aku|saya|ku|dong|ya|kak|please|tolong|aja|nih|deh|plis|pls)\b/i', ' ', $prefix) ?? $prefix;
+            $prefix = trim(preg_replace('/\s+/', ' ', $prefix) ?? $prefix);
+            if ($prefix !== '') {
+                return $prefix;
+            }
+        }
+
+        $clean = preg_replace('/\b(edit|editt|update|ubah|ubahin|rubah|ganti|gantiin|gnti|change|rename|renamein|reschedule|reskedul|editin|revisi|benerin|bnerin|perbaiki|perbaikin|perbarui|jadwalin ulang|jadwalkan ulang|majuin|mundurin|delete|delet|delte|remove|hapus|hpus|apus|apusin|hapusin|buang|ilangin|hilangin|removein|deletein|complete|finish|done|donee|selesai|slesai|selsai|selese|selesein|selesaiin|beres|beress|kelar|kelarin|rampung|tuntas|tuntasin|tandai selesai|mark done|mark as done|task|todo|tugas|yang|ini|itu|the|my|aku|saya|ku|dong|ya|kak|please|tolong|aja|nih|deh|plis|pls)\b/i', ' ', $text) ?? $text;
+        $clean = preg_replace('/\b(deadline|tanggal|date|jam|pukul|at|priority|prioritas|high|medium|low|tinggi|sedang|rendah|deskripsi|description|desc|judul|title|nama|namanya|besok|tomorrow|tomorow|tommorow|today|hari ini|jadi|to|ke)\b/i', ' ', $clean) ?? $clean;
+        $clean = preg_replace('/\b\d{1,2}(?:[.:]\d{2})?\b/', ' ', $clean) ?? $clean;
+
+        return trim(preg_replace('/\s+/', ' ', $clean) ?? $clean);
+    }
+
+    private function hasFuzzyWord(string $text, array $targets): bool
+    {
+        foreach ($this->words($text) as $word) {
+            foreach ($targets as $target) {
+                if ($this->isCloseWord($word, $target)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private function removeIntentWords(string $text, array $targets): string
+    {
+        $words = preg_split('/\s+/', $text) ?: [];
+        $kept = [];
+
+        foreach ($words as $word) {
+            $clean = trim(strtolower($word), " \t\n\r\0\x0B,.;:!?\"'“”");
+            $isIntent = false;
+            foreach ($targets as $target) {
+                if ($this->isCloseWord($clean, $target)) {
+                    $isIntent = true;
+                    break;
+                }
+            }
+
+            if (!$isIntent) {
+                $kept[] = $word;
+            }
+        }
+
+        return trim(implode(' ', $kept));
+    }
+
+    private function isCloseWord(string $word, string $target): bool
+    {
+        $word = $this->normalizeWord($word);
+        $target = $this->normalizeWord($target);
+
+        if ($word === '' || $target === '') {
+            return false;
+        }
+
+        if ($word === $target || str_starts_with($word, $target) || str_starts_with($target, $word)) {
+            return abs(mb_strlen($word) - mb_strlen($target)) <= 3;
+        }
+
+        $maxDistance = mb_strlen($target) <= 4 ? 0 : (mb_strlen($target) <= 5 ? 1 : 2);
+
+        return levenshtein($word, $target) <= $maxDistance;
+    }
+
+    private function normalizeWord(string $word): string
+    {
+        $word = strtolower($word);
+        $word = preg_replace('/[^a-z0-9]/', '', $word) ?? $word;
+        $word = preg_replace('/(.)\1{2,}/', '$1$1', $word) ?? $word;
+
+        return trim($word);
+    }
+
+    private function words(string $text): array
+    {
+        return array_values(array_filter(
+            preg_split('/\s+/', strtolower($text)) ?: [],
+            fn (string $word) => mb_strlen($this->normalizeWord($word)) >= 2,
+        ));
+    }
+
+    private function extractUpdates(string $text): array
+    {
+        $updates = [];
+        $deadline = $this->extractDeadline($text);
+        if ($deadline) {
+            $updates['deadline'] = $deadline->toDateTimeString();
+        }
+
+        $priority = $this->extractPriority(strtolower($text));
+        if ($priority) {
+            $updates['priority'] = $priority;
+        }
+
+        $description = $this->extractDescriptionUpdate($text);
+        if ($description !== null) {
+            $updates['deskripsi'] = $description;
+        }
+
+        $title = $this->extractTitleUpdate($text);
+
+        if ($title !== null) {
+            $updates['judul'] = $this->extractTitle($title);
+        }
+
+        return $updates;
+    }
+
+    private function findUserTask(User $user, string $needle): ?Todo
+    {
+        return $this->findUserTasks($user, $needle, 1)->first();
+    }
+
+    private function findUserTasks(User $user, string $needle, int $limit = 5)
+    {
+        $needle = trim($needle);
+        if ($needle === '') {
+            return $this->activeTasks($user, $limit);
+        }
+
+        if ($this->isLastTaskReference($needle) && ($lastTask = $this->lastReferencedTask($user))) {
+            return collect([$lastTask]);
+        }
+
+        return Todo::query()
+            ->where('user_id', $user->id)
+            ->where('judul', 'ilike', '%' . $needle . '%')
+            ->orderBy('is_completed')
+            ->orderBy('deadline')
+            ->limit($limit)
+            ->get();
+    }
+
+    private function findUserTasksByWords(User $user, string $needle, int $limit = 5)
+    {
+        $words = array_values(array_filter(
+            preg_split('/\s+/', strtolower($needle)) ?: [],
+            fn (string $word) => mb_strlen($word) >= 3 && !in_array($word, ['tomorrow', 'tomorow', 'tommorow', 'today', 'besok', 'pagi', 'siang', 'sore', 'malam', 'nanti', 'lusa'], true),
+        ));
+
+        if (empty($words)) {
+            return collect();
+        }
+
+        return Todo::query()
+            ->where('user_id', $user->id)
+            ->orderBy('is_completed')
+            ->orderBy('deadline')
+            ->limit(30)
+            ->get()
+            ->map(function (Todo $todo) use ($words) {
+                $title = strtolower($todo->judul);
+                $score = 0;
+                foreach ($words as $word) {
+                    if (str_contains($title, $word)) {
+                        $score++;
+                    }
+                }
+
+                return ['todo' => $todo, 'score' => $score];
+            })
+            ->filter(fn (array $item) => $item['score'] >= max(1, count($words) - 1))
+            ->sortByDesc('score')
+            ->take($limit)
+            ->map(fn (array $item) => $item['todo'])
+            ->values();
+    }
+
+    private function activeTasks(User $user, int $limit = 5)
+    {
+        return Todo::query()
+            ->where('user_id', $user->id)
+            ->where('is_completed', false)
+            ->orderByRaw('deadline is null')
+            ->orderBy('deadline')
+            ->limit($limit)
+            ->get();
+    }
+
+    private function taskPayload(Todo $todo): array
+    {
+        return [
+            'id' => $todo->id,
+            'title' => $todo->judul,
+            'description' => $todo->deskripsi,
+            'deadline' => $todo->deadline?->toDateTimeString(),
+            'priority' => $todo->priority,
+            'completed' => (bool) $todo->is_completed,
+        ];
+    }
+
+    private function mergeDraft(array $draft, string $text): array
+    {
+        $lower = strtolower($text);
+        $deadline = $this->extractDeadline($text);
+        if ($deadline) {
+            $draft['deadline'] = $deadline->toDateTimeString();
+        }
+
+        $priority = $this->extractPriority($lower);
+        if ($priority) {
+            $draft['priority'] = $priority;
+        }
+
+        $description = $this->extractDescriptionUpdate($text);
+        if ($description !== null) {
+            $draft['description'] = $description;
+        }
+
+        $title = $this->extractTitleUpdate($text);
+        if ($title !== null) {
+            $draft['title'] = $this->extractTitle($title);
+        }
+
+        return $draft;
+    }
+
+    private function extractTitleUpdate(string $text): ?string
+    {
+        $patterns = [
+            '/\b(?:task|todo|tugas)?\s*(?:baru\s+)?(?:bernama|namanya|nama|judul|title)\s*(?::|=|adalah|is|jadi|dengan)?\s*(.+)$/i',
+            '/\b(?:ubah|ubahin|rubah|ganti|gantiin|change|update|rename|renam)\s+(?:judul|title|nama|namanya)(?:\s+(?:task|todo|tugas))?\s+.+?\s+(?:jadi|to|ke|=|:)\s*(.+)$/i',
+            '/\b(?:ubah|ubahin|rubah|ganti|gantiin|change|update|rename|renam)\s+(?:judul|title|nama|namanya)(?:\s+(?:task|todo|tugas))?\s*(?:jadi|to|ke|=|:)?\s*(.+)$/i',
+            '/\b(?:judul|title|nama|namanya|bernama)(?:\s+(?:task|todo|tugas))?\s*(?:jadi|to|ke|=|:|adalah|is)?\s*(.+)$/i',
+            '/\b(?:rename\s+to|renam\s+to|ganti\s+nama|ubah\s+judul)\s*(.+)$/i',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $text, $match)) {
+                return $this->cleanFieldUpdateValue($match[1]);
+            }
+        }
+
+        $title = $this->extractField($text, ['bernama', 'nama', 'namanya', 'judul', 'title']);
+        return $title === null ? null : $this->cleanFieldUpdateValue($title);
+    }
+
+    private function extractDescriptionUpdate(string $text): ?string
+    {
+        $patterns = [
+            '/\b(?:ubah|ubahin|rubah|ganti|gantiin|change|update)\s+(?:deskripsi|description|desc)(?:\s+(?:task|todo|tugas))?\s+.+?\s+(?:jadi|to|ke|=|:)\s*(.+)$/i',
+            '/\b(?:ubah|ubahin|rubah|ganti|gantiin|change|update)\s+(?:deskripsi|description|desc)(?:\s+(?:task|todo|tugas))?\s*(?:jadi|to|ke|=|:)?\s*(.+)$/i',
+            '/\b(?:deskripsi|description|desc)(?:\s+(?:task|todo|tugas))?\s*(?:jadi|to|ke|=|:|adalah|is)\s*(.+)$/i',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $text, $match)) {
+                return $this->cleanFieldUpdateValue($match[1]);
+            }
+        }
+
+        $description = $this->extractField($text, ['deskripsi', 'description', 'desc']);
+        return $description === null ? null : $this->cleanFieldUpdateValue($description);
+    }
+
+    private function cleanFieldUpdateValue(string $value): string
+    {
+        $value = trim($value, " \t\n\r\0\x0B\"'“”");
+        $value = preg_replace('/^(?:task|todo|tugas)\s+(?:jadi|to|ke|=|:)\s+/i', '', $value) ?? $value;
+        $value = preg_replace('/\s*,?\s*(?:deskripsi|description|desc|deadline|tanggal|date|jam|pukul|priority|prioritas)\b.*$/i', '', $value) ?? $value;
+
+        return trim($value, " \t\n\r\0\x0B\"'“”");
+    }
+
+    private function createFromDraft(User $user, string $draftKey, array $draft): array
+    {
+        if (empty($draft['title'])) {
+            return ['action' => 'draft_task', 'draft' => $draft, 'note' => 'Boleh. Judul task-nya apa dulu? Contoh: “judul Coding PHP”. Kalau batal, bilang “batal” ya 🙂'];
+        }
+
+        if (!$this->deadlineWithinAllowedRange($draft['deadline'] ?? null)) {
+            Cache::forget($draftKey);
+
+            return $this->deadlineTooFarResponse();
+        }
+
+        $todo = Todo::create([
+            'judul' => $draft['title'],
+            'deskripsi' => $draft['description'] ?? null,
+            'is_completed' => false,
+            'deadline' => $draft['deadline'] ?? null,
+            'priority' => $draft['priority'] ?? 'medium',
+            'user_id' => $user->id,
+            'device_id' => null,
+        ]);
+        Cache::forget($draftKey);
+        Cache::forget("ai:context:{$user->id}");
+        $this->rememberTaskReference($user, $todo);
+
+        return [
+            'action' => 'created_task',
+            'task' => $todo->fresh(),
+            'note' => $this->t(
+                "Done! \"{$todo->judul}\" has been created ✅ Priority: {$todo->priority}" . ($todo->deadline ? ", deadline {$todo->deadline->format('Y-m-d H:i')}" : '') . '.',
+                "Siap, “{$todo->judul}” sudah aku buat ✅ Priority: {$todo->priority}" . ($todo->deadline ? ", deadline {$todo->deadline->format('Y-m-d H:i')}" : '') . '.'
+            ),
+        ];
+    }
+
+    private function draftPrompt(array $draft): string
+    {
+        if ($this->usesEnglish) {
+            $summary = "Here's your draft:"
+                . "\n- Title: " . ($draft['title'] ?: 'not set')
+                . "\n- Description: " . ($draft['description'] ?: 'empty')
+                . "\n- Deadline: " . ($draft['deadline'] ?: 'not set')
+                . "\n- Priority: " . ($draft['priority'] ?: 'medium');
+
+            $missing = [];
+            if (empty($draft['title'])) {
+                $missing[] = 'title';
+            }
+            if (empty($draft['deadline'])) {
+                $missing[] = 'deadline or date/time';
+            }
+
+            if ($missing) {
+                return $summary . "\n\nStill missing: " . implode(', ', $missing) . '. Fill those in, or say "save" to save as-is. Say "cancel" to abort.';
+            }
+
+            return $summary . '\n\nReady to save? Say "save". Or send updated details to change 👌';
+        }
+
+        $summary = 'Sip, draft-nya aku siapin:'
+            . "\n- Judul: " . ($draft['title'] ?: 'belum ada')
+            . "\n- Deskripsi: " . ($draft['description'] ?: 'kosong')
+            . "\n- Deadline: " . ($draft['deadline'] ?: 'belum ada')
+            . "\n- Priority: " . ($draft['priority'] ?: 'medium');
+
+        $missing = [];
+        if (empty($draft['title'])) {
+            $missing[] = 'judul';
+        }
+        if (empty($draft['deadline'])) {
+            $missing[] = 'deadline atau tanggal/jam';
+        }
+
+        if ($missing) {
+            return $summary . "\n\nYang kurang: " . implode(', ', $missing) . '. Lengkapi aja, atau bilang “simpan” kalau ini sudah cukup. Kalau batal, bilang “batal” 🙂';
+        }
+
+        return $summary . "\n\nMau langsung aku simpan? Balas “simpan”. Kalau mau ubah, kirim detailnya aja 👌";
+    }
+
+    private function extractTitle(string $text): string
+    {
+        if (preg_match('/["“”\']([^"“”\']+)["“”\']/', $text, $quoted)) {
+            return trim($quoted[1]);
+        }
+
+        if (preg_match('/\b(?:bernama|nama(?:nya)?|judul|title)\s*(?::|=|adalah|is|jadi|dengan)?\s*(.+?)(?=\s*[,;\n]\s*(?:deskripsi|description|desc|deadline|due|tenggat|priority|prioritas)\b|$)/i', $text, $match)) {
+            return trim($match[1], " \t\n\r\0\x0B\"'“”");
+        }
+
+        $fieldTitle = $this->extractField($text, ['bernama', 'nama', 'namanya', 'judul', 'title']);
+        if ($fieldTitle !== null) {
+            return trim($fieldTitle);
+        }
+
+        $title = trim(preg_replace('/\b(baru|untuk|for|besok|tomorrow|today|hari ini|nanti|malam|pagi|siang|sore|lusa|minggu depan|akhir bulan|deskripsi|description|desc|deadline|jam|pukul|at|priority|prioritas|high|medium|mid|low|tinggi|sedang|rendah)\b.*$/i', '', $text));
+
+        return trim($title) ?: trim($text);
+    }
+
+    private function hasStructuredTaskFields(string $text): bool
+    {
+        return $this->extractField($text, ['judul', 'title', 'bernama', 'nama', 'namanya']) !== null
+            && ($this->extractField($text, ['deadline', 'due', 'tenggat']) !== null || $this->extractDeadline($text) !== null);
+    }
+
+    private function extractField(string $text, array $labels): ?string
+    {
+        $labelPattern = implode('|', array_map(fn (string $label) => preg_quote($label, '/'), $labels));
+        $stopPattern = 'judul|title|bernama|nama|namanya|deskripsi|description|desc|deadline|due|tenggat|priority|prioritas';
+
+        if (!preg_match('/(?:^|[,;\n])\s*(?:' . $labelPattern . ')\s*(?::|=|adalah|is|jadi|dengan)?\s*(.+?)(?=\s*[,;\n]\s*(?:' . $stopPattern . ')\s*(?::|=|adalah|is|jadi|dengan)?|$)/i', $text, $match)) {
+            return null;
+        }
+
+        $value = trim($match[1], " \t\n\r\0\x0B\"'“”");
+
+        return $value === '' ? null : $value;
+    }
+
+    private function extractPriority(string $lower): ?string
+    {
+        if (str_contains($lower, 'high') || str_contains($lower, 'tinggi')) {
+            return 'high';
+        }
+        if (str_contains($lower, 'low') || str_contains($lower, 'rendah')) {
+            return 'low';
+        }
+        if (preg_match('/\b(medium|mid|med|sedang)\b/', $lower) === 1) {
+            return 'medium';
+        }
+
+        return null;
+    }
+
+    private function extractDeadline(string $text): ?Carbon
+    {
+        try {
+            if (preg_match('/\b(20\d{2})[-\/]([01]?\d)[-\/]([0-3]?\d)\b/', $text, $date)) {
+                return Carbon::create((int) $date[1], (int) $date[2], (int) $date[3], 20, 0);
+            }
+
+            if (preg_match('/\b([0-3]?\d)[-\/]([01]?\d)[-\/](20\d{2})\b/', $text, $date)) {
+                return Carbon::create((int) $date[3], (int) $date[2], (int) $date[1], 20, 0);
+            }
+
+            if (preg_match('/\b(?:(?:jam|pukul|at)\s*)?(\d{1,2})[.:](\d{2})\b/i', $text, $time)) {
+                $base = $this->dateBase($text);
+
+                return $base->setTime((int) $time[1], (int) $time[2]);
+            }
+
+            if (preg_match('/\b(?:jam|pukul)\s*(\d{1,2})(?::(\d{2}))?\s*(pagi|siang|sore|malam)?\b/i', $text, $time)) {
+                $base = $this->dateBase($text);
+                $hour = (int) $time[1];
+                $period = strtolower($time[3] ?? '');
+                if (in_array($period, ['sore', 'malam'], true) && $hour < 12) {
+                    $hour += 12;
+                }
+
+                return $base->setTime($hour, (int) ($time[2] ?? 0));
+            }
+            if (preg_match('/\b(\d{1,2})\s*(am|pm)\b/i', $text, $time)) {
+                $base = $this->dateBase($text);
+                $hour = (int) $time[1] + (strtolower($time[2]) === 'pm' && (int) $time[1] < 12 ? 12 : 0);
+                return $base->setTime($hour, 0);
+            }
+
+            $base = $this->dateBase($text);
+            if (preg_match('/\b(?:nanti\s+malam|malam\s+ini)\b/i', $text)) {
+                return $base->setTime(20, 0);
+            }
+            if (preg_match('/\b(?:besok\s+pagi|tomorrow\s+morning)\b/i', $text)) {
+                return $base->setTime(8, 0);
+            }
+            if (preg_match('/\b(?:besok\s+siang)\b/i', $text)) {
+                return $base->setTime(13, 0);
+            }
+            if (preg_match('/\b(?:besok\s+sore)\b/i', $text)) {
+                return $base->setTime(16, 0);
+            }
+            if (preg_match('/\b(?:besok\s+malam)\b/i', $text)) {
+                return $base->setTime(20, 0);
+            }
+            if (preg_match('/\b(tomorrow|tomorow|tommorow|besok)\b/i', $text)) {
+                return $base->setTime(20, 0);
+            }
+            if (preg_match('/\b(lusa)\b/i', $text)) {
+                return $base->setTime(20, 0);
+            }
+            if (preg_match('/\b(today|hari ini)\b/i', $text)) {
+                return $base->setTime(20, 0);
+            }
+            if (preg_match('/\b(?:minggu\s+depan|next\s+week)\b/i', $text)) {
+                return $base->setTime(20, 0);
+            }
+            if (preg_match('/\b(?:akhir\s+bulan|end\s+of\s+month)\b/i', $text)) {
+                return $base->setTime(20, 0);
+            }
+            if (preg_match('/\b(senin|selasa|rabu|kamis|jumat|jum\'at|sabtu|minggu)\s+depan\b/i', $text)) {
+                return $base->setTime(20, 0);
+            }
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return null;
+    }
+
+    private function dateBase(string $text): Carbon
+    {
+        $now = now();
+        if (preg_match('/\b(tomorrow|tomorow|tommorow|besok)\b/i', $text)) {
+            return $now->copy()->addDay();
+        }
+        if (preg_match('/\blusa\b/i', $text)) {
+            return $now->copy()->addDays(2);
+        }
+        if (preg_match('/\b(?:minggu\s+depan|next\s+week)\b/i', $text)) {
+            return $now->copy()->addWeek();
+        }
+        if (preg_match('/\b(?:akhir\s+bulan|end\s+of\s+month)\b/i', $text)) {
+            return $now->copy()->endOfMonth();
+        }
+        if (preg_match('/\b(senin|selasa|rabu|kamis|jumat|jum\'at|sabtu|minggu)\s+depan\b/i', $text, $match)) {
+            $days = [
+                'senin' => Carbon::MONDAY,
+                'selasa' => Carbon::TUESDAY,
+                'rabu' => Carbon::WEDNESDAY,
+                'kamis' => Carbon::THURSDAY,
+                'jumat' => Carbon::FRIDAY,
+                'jum\'at' => Carbon::FRIDAY,
+                'sabtu' => Carbon::SATURDAY,
+                'minggu' => Carbon::SUNDAY,
+            ];
+            return $now->copy()->next($days[strtolower($match[1])] ?? Carbon::MONDAY);
+        }
+
+        return $now->copy();
+    }
+
+    private function deadlineWithinAllowedRange(mixed $deadline): bool
+    {
+        if (empty($deadline)) {
+            return true;
+        }
+
+        try {
+            $date = $deadline instanceof Carbon ? $deadline : Carbon::parse((string) $deadline);
+        } catch (\Throwable) {
+            return false;
+        }
+
+        return !$date->greaterThan(now()->addYears(self::MAX_DEADLINE_YEARS)->endOfDay());
+    }
+
+    private function hasOutOfRangeExplicitYear(string $text): bool
+    {
+        if (!preg_match_all('/\b20\d{2}\b/', $text, $matches)) {
+            return false;
+        }
+
+        $maxYear = now()->addYears(self::MAX_DEADLINE_YEARS)->year;
+        foreach ($matches[0] as $year) {
+            if ((int) $year > $maxYear) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function isBulkModificationRequest(string $lower): bool
+    {
+        $hasBulk = preg_match('/\b(semua|all(?:\s+(?:the|my))?\s+tasks?|seluruh|setiap|tiap|semua\s+yang|all\s+(?:overdue|completed?|pending|active))\b/', $lower) === 1
+            || preg_match('/\b(semua|all)\b.*\b(tasks?|tugas|todo)\b/', $lower) === 1;
+
+        $hasModify = $this->hasFuzzyWord($lower, array_merge(self::COMPLETE_WORDS, self::DELETE_WORDS, self::EDIT_WORDS))
+            || preg_match('/\b(jadi\s+(?:done|selesai|completed?)|status(?:nya)?\s+(?:berganti|ganti|ubah|jadi)|mark\s+(?:all|as))\b/', $lower) === 1;
+
+        return $hasBulk && $hasModify;
+    }
+
+    private function deadlineTooFarResponse(): array
+    {
+        $maxYear = now()->addYears(self::MAX_DEADLINE_YEARS)->year;
+
+        return [
+            'action' => 'deadline_out_of_range',
+            'kind' => 'validation_error',
+            'note' => $this->t(
+                "Task deadline must be within " . self::MAX_DEADLINE_YEARS . " years (max: {$maxYear}). Please pick a closer date.",
+                "Deadline task maksimal sampai tahun {$maxYear}. Coba pilih tanggal yang masih dalam range +" . self::MAX_DEADLINE_YEARS . ' tahun ya.'
+            ),
+        ];
+    }
+
+    private function isSummaryRequest(string $lower): bool
+    {
+        return preg_match('/\b(summarize|summary|ringkasan|rekap|rekapitulasi|laporan|report|statistik|stats|overview|rangkuman)\b/', $lower) === 1
+            || (preg_match('/\b(berapa\s+(?:banyak|jumlah)|how\s+many|seberapa\s+banyak)\b/', $lower) === 1
+                && preg_match('/\b(task|tugas|todo)\b/', $lower) === 1);
+    }
+
+    private function isClosestDeadlineRequest(string $lower): bool
+    {
+        return preg_match('/\b(closest|nearest|paling\s+dekat|terdekat)\b.*\b(deadline|tenggat)\b/', $lower) === 1
+            || preg_match('/\b(deadline|tenggat)\b.*\b(closest|nearest|terdekat|paling\s+dekat)\b/', $lower) === 1
+            || preg_match('/\btask\b.*\b(apa|which|mana)\b.*\b(closest|nearest|paling\s+dekat|terdekat)\b.*\bdeadline\b/', $lower) === 1
+            || preg_match('/\b(what|apa)\b.*\btask\b.*\b(closest|nearest|paling\s+dekat|terdekat)\b/', $lower) === 1;
+    }
+
+    private function isOverdueRequest(string $lower): bool
+    {
+        return preg_match('/\b(overdue|terlambat|terlewat|lewat\s+deadline|sudah\s+lewat\s+(?:deadline|tenggat))\b/', $lower) === 1;
+    }
+
+    private function isActiveTaskListRequest(string $lower): bool
+    {
+        return preg_match('/\b(show|list|tampilkan|lihat|liat|view)\b.*\b(task|tugas|todo|agenda)\b/', $lower) === 1
+            || preg_match('/\b(apa\s+saja|apa\s+aja|what\s+are)\b.*\b(task|tugas|todo)\b/', $lower) === 1
+            || preg_match('/\b(daftar)\s+(task|tugas|todo)\b/', $lower) === 1;
+    }
+
+    private function handleSummaryRequest(User $user, string $lower): array
+    {
+        $now = now();
+        $isMonthly = preg_match('/\b(bulan\s+(?:ini|lalu|kemarin)|this\s+month|last\s+month|monthly)\b/', $lower) === 1;
+
+        if ($isMonthly) {
+            $start = $now->copy()->startOfMonth();
+            $end = $now->copy()->endOfMonth();
+
+            $completed = Todo::where('user_id', $user->id)->where('is_completed', true)->whereBetween('created_at', [$start, $end])->count();
+            $overdue = Todo::where('user_id', $user->id)->where('is_completed', false)->where('deadline', '<', $now)->whereBetween('created_at', [$start, $end])->count();
+            $total = Todo::where('user_id', $user->id)->whereBetween('created_at', [$start, $end])->count();
+            $unfinished = max(0, $total - $completed);
+
+            $priorityCounts = [
+                'high' => Todo::where('user_id', $user->id)->where('priority', 'high')->whereBetween('created_at', [$start, $end])->count(),
+                'medium' => Todo::where('user_id', $user->id)->where('priority', 'medium')->whereBetween('created_at', [$start, $end])->count(),
+                'low' => Todo::where('user_id', $user->id)->where('priority', 'low')->whereBetween('created_at', [$start, $end])->count(),
+            ];
+
+            return [
+                'action' => 'task_summary',
+                'kind' => 'monthly_summary',
+                'month' => $now->format('F Y'),
+                'counts' => ['completed' => $completed, 'unfinished' => $unfinished, 'overdue' => $overdue],
+                'priority_counts' => $priorityCounts,
+                'tasks' => [],
+                'note' => $this->t(
+                    "Here's your task summary for {$now->format('F Y')} 📊",
+                    "Ini rekap task kamu bulan {$now->format('F Y')} 📊"
+                ),
+            ];
+        }
+
+        $isAll = preg_match('/\b(all|semua|seluruh|keseluruhan|all\s+tasks?|semua\s+task)\b/', $lower) === 1;
+
+        if ($isAll) {
+            $completed = Todo::where('user_id', $user->id)->where('is_completed', true)->count();
+            $overdue = Todo::where('user_id', $user->id)->where('is_completed', false)->where('deadline', '<', $now)->count();
+            $unfinished = max(0, Todo::where('user_id', $user->id)->where('is_completed', false)->count() - $overdue);
+
+            $priorityCounts = [
+                'high' => Todo::where('user_id', $user->id)->where('is_completed', false)->where('priority', 'high')->count(),
+                'medium' => Todo::where('user_id', $user->id)->where('is_completed', false)->where('priority', 'medium')->count(),
+                'low' => Todo::where('user_id', $user->id)->where('is_completed', false)->where('priority', 'low')->count(),
+            ];
+
+            return [
+                'action' => 'task_summary',
+                'kind' => 'all_summary',
+                'counts' => ['completed' => $completed, 'unfinished' => $unfinished, 'overdue' => $overdue],
+                'priority_counts' => $priorityCounts,
+                'tasks' => [],
+                'note' => $this->t("Here's a summary of all your tasks 📊", "Ini ringkasan semua task kamu 📊"),
+            ];
+        }
+
+        $today = $now->toDateString();
+
+        $completed = Todo::where('user_id', $user->id)->where('is_completed', true)->whereDate('deadline', $today)->count();
+        $overdue = Todo::where('user_id', $user->id)->where('is_completed', false)->whereDate('deadline', $today)->where('deadline', '<', $now)->count();
+        $unfinished = max(0, Todo::where('user_id', $user->id)->where('is_completed', false)->whereDate('deadline', $today)->count() - $overdue);
+
+        $priorityCounts = [
+            'high' => Todo::where('user_id', $user->id)->where('is_completed', false)->whereDate('deadline', $today)->where('priority', 'high')->count(),
+            'medium' => Todo::where('user_id', $user->id)->where('is_completed', false)->whereDate('deadline', $today)->where('priority', 'medium')->count(),
+            'low' => Todo::where('user_id', $user->id)->where('is_completed', false)->whereDate('deadline', $today)->where('priority', 'low')->count(),
+        ];
+
+        return [
+            'action' => 'task_summary',
+            'kind' => 'summary',
+            'counts' => ['completed' => $completed, 'unfinished' => $unfinished, 'overdue' => $overdue],
+            'priority_counts' => $priorityCounts,
+            'tasks' => [],
+            'note' => $this->t("Here's your task summary for today 📊", "Ini ringkasan task kamu hari ini 📊"),
+        ];
+    }
+
+    private function handleClosestDeadlineRequest(User $user): array
+    {
+        $task = Todo::where('user_id', $user->id)
+            ->where('is_completed', false)
+            ->whereNotNull('deadline')
+            ->orderBy('deadline')
+            ->first();
+
+        if (!$task) {
+            return [
+                'action' => 'task_summary',
+                'kind' => 'empty_state',
+                'title' => $this->t('No upcoming deadlines', 'Tidak ada deadline yang mendekat'),
+                'note' => $this->t("You have no pending tasks with deadlines — all clear! 🎉", "Tidak ada task yang punya deadline aktif. Bersih banget! 🎉"),
+            ];
+        }
+
+        $this->rememberTaskReference($user, $task);
+        return [
+            'action' => 'task_summary',
+            'kind' => 'closest_deadline',
+            'task' => $this->taskPayload($task),
+            'note' => $this->t(
+                "The task closest to its deadline is \"{$task->judul}\" 📅",
+                "Task yang paling dekat deadlinenya adalah \"{$task->judul}\" 📅"
+            ),
+        ];
+    }
+
+    private function handleOverdueRequest(User $user): array
+    {
+        $tasks = Todo::where('user_id', $user->id)
+            ->where('is_completed', false)
+            ->where('deadline', '<', now())
+            ->orderBy('deadline')
+            ->limit(10)
+            ->get();
+
+        if ($tasks->isEmpty()) {
+            return [
+                'action' => 'task_summary',
+                'kind' => 'empty_state',
+                'title' => $this->t('No overdue tasks', 'Tidak ada task overdue'),
+                'note' => $this->t("No overdue tasks — you're right on track! 🙌", "Tidak ada task yang overdue. Kamu keren! 🙌"),
+            ];
+        }
+
+        return [
+            'action' => 'task_summary',
+            'kind' => 'overdue_tasks',
+            'tasks' => $tasks->map(fn($t) => $this->taskPayload($t))->values()->all(),
+            'note' => $this->t(
+                "You have {$tasks->count()} overdue task(s) 👇",
+                "Ada {$tasks->count()} task yang sudah overdue nih 👇"
+            ),
+        ];
+    }
+
+    private function handleActiveTaskListRequest(User $user): array
+    {
+        $tasks = $this->activeTasks($user, 8);
+
+        if ($tasks->isEmpty()) {
+            return [
+                'action' => 'task_summary',
+                'kind' => 'empty_state',
+                'title' => $this->t('No active tasks', 'Belum ada task aktif'),
+                'note' => $this->t("You have no active tasks right now. Want to add one?", "Kamu belum punya task aktif. Mau bikin satu?"),
+            ];
+        }
+
+        return [
+            'action' => 'task_summary',
+            'kind' => 'task_list',
+            'tasks' => $tasks->map(fn($t) => $this->taskPayload($t))->values()->all(),
+            'note' => $this->t("Here are your active tasks 📋", "Ini task-task aktif kamu 📋"),
+        ];
+    }
+}
