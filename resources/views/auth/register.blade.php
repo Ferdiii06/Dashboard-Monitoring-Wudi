@@ -160,7 +160,7 @@
             <div id="slides-container" class="relative flex-1 flex flex-col justify-center min-h-[350px]">
                 
                 <!-- SLIDE 1 (Productivity Stats) -->
-                <div class="carousel-slide space-y-6 transition-all duration-500 opacity-100 transform translate-x-0" data-slide-index="0">
+                <div class="carousel-slide absolute inset-0 flex flex-col justify-center space-y-6 transition-all duration-500 opacity-100 transform translate-x-0" data-slide-index="0">
                     <!-- Mock Card 1 -->
                     <div class="rounded-2xl border border-white/10 bg-white/5 p-6 backdrop-blur-md shadow-lg max-w-sm ml-auto">
                         <div class="flex items-center justify-between text-xs text-amber-200/80 font-bold uppercase tracking-wide">
@@ -193,7 +193,7 @@
                 </div>
 
                 <!-- SLIDE 2 (Security & Performance) -->
-                <div class="carousel-slide space-y-6 transition-all duration-500 opacity-0 transform translate-x-12 hidden" data-slide-index="1">
+                <div class="carousel-slide absolute inset-0 flex flex-col justify-center space-y-6 transition-all duration-500 opacity-0 transform translate-x-12 hidden" data-slide-index="1">
                     <!-- Mock Card 1 -->
                     <div class="rounded-2xl border border-white/10 bg-white/5 p-6 backdrop-blur-md shadow-lg max-w-sm ml-auto">
                         <div class="flex items-center justify-between text-xs text-amber-200/80 font-bold uppercase tracking-wide">
@@ -218,7 +218,7 @@
                 </div>
 
                 <!-- SLIDE 3 (AI assistant) -->
-                <div class="carousel-slide space-y-6 transition-all duration-500 opacity-0 transform translate-x-12 hidden" data-slide-index="2">
+                <div class="carousel-slide absolute inset-0 flex flex-col justify-center space-y-6 transition-all duration-500 opacity-0 transform translate-x-12 hidden" data-slide-index="2">
                     <!-- Mock Card 1 -->
                     <div class="rounded-2xl border border-white/10 bg-white/5 p-6 backdrop-blur-md shadow-lg max-w-sm ml-auto">
                         <div class="flex items-center justify-between text-xs text-amber-200/80 font-bold uppercase tracking-wide">
